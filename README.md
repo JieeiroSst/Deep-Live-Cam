@@ -387,3 +387,22 @@ Looking for a CLI mode? Using the -s/--source argument will make the run program
    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=hacksider/deep-live-cam&type=Date" />
  </picture>
 </a>
+
+```
+Note
+
+python3.11 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+
+python run.py
+Apple Silicon (CoreML): python run.py --execution-provider coreml
+(requires pip install onnxruntime-silicon==1.13.1)
+
+
+
+install the tkinter package for Python 3.11 macos
+brew install python-tk@3.11
+brew install ffmpeg
+
+```
