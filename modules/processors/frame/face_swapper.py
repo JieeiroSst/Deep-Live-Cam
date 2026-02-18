@@ -23,6 +23,7 @@ import time
 FACE_SWAPPER = None
 THREAD_LOCK = threading.Lock()
 NAME = "DLC.FACE-SWAPPER"
+MODELS_LOADED = threading.Event()  # Signals when all models are preloaded
 
 # --- START: Added for Interpolation ---
 PREVIOUS_FRAME_RESULT = None # Stores the final processed frame from the previous step
@@ -102,6 +103,23 @@ def get_face_swapper() -> Any:
     return FACE_SWAPPER
 
 
+def preload_models() -> None:
+    """Pre-warm face analyser and face swapper models so the first live frame
+    doesn't stall.  Safe to call from any thread; the underlying loaders are
+    already thread-safe."""
+    from modules.face_analyser import get_face_analyser
+
+    try:
+        get_face_analyser()
+    except Exception as e:
+        print(f"{NAME}: Warning: face analyser preload failed: {e}")
+    try:
+        get_face_swapper()
+    except Exception as e:
+        print(f"{NAME}: Warning: face swapper preload failed: {e}")
+    MODELS_LOADED.set()
+
+
 def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     """Optimized face swapping with better memory management and performance."""
     face_swapper = get_face_swapper()
@@ -115,8 +133,13 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     if not hasattr(source_face, 'normed_embedding') or source_face.normed_embedding is None:
         return temp_frame
 
-    # Store a copy of the original frame before swapping for opacity blending
-    original_frame = temp_frame.copy()
+    opacity = getattr(modules.globals, "opacity", 1.0)
+    mouth_mask_enabled = getattr(modules.globals, "mouth_mask", False)
+    poisson_enabled = getattr(modules.globals, "poisson_blend", False)
+
+    # Only copy original frame when needed for blending
+    needs_original = opacity < 1.0 or mouth_mask_enabled or poisson_enabled
+    original_frame = temp_frame.copy() if needs_original else temp_frame
 
     # Pre-swap Input Check with optimization
     if temp_frame.dtype != np.uint8:
@@ -153,9 +176,11 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
                  # print(f"Error resizing swapped frame: {resize_e}") # Debug
                  return original_frame
 
-        # Explicitly clip values to 0-255 and convert to uint8
-        # This handles cases where the model might output floats or values outside the valid range
-        swapped_frame = np.clip(swapped_frame_raw, 0, 255).astype(np.uint8)
+        # Convert to uint8, only clip if needed
+        if swapped_frame_raw.dtype == np.uint8:
+            swapped_frame = swapped_frame_raw
+        else:
+            swapped_frame = np.clip(swapped_frame_raw, 0, 255).astype(np.uint8)
         # --- END: CRITICAL FIX FOR ORT 1.17 ---
 
     except Exception as e:
@@ -167,7 +192,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     # --- Post-swap Processing (Masking, Opacity, etc.) ---
     # Now, work with the guaranteed uint8 'swapped_frame'
 
-    if getattr(modules.globals, "mouth_mask", False): # Check if mouth_mask is enabled
+    if mouth_mask_enabled: # Check if mouth_mask is enabled
         # Create a mask for the target face
         face_mask = create_face_mask(target_face, temp_frame) # Use temp_frame (original shape) for mask creation geometry
 
@@ -191,7 +216,7 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
                         )
         
     # --- Poisson Blending ---
-    if getattr(modules.globals, "poisson_blend", False):
+    if poisson_enabled:
         face_mask = create_face_mask(target_face, temp_frame)
         if face_mask is not None:
             # Find bounding box of the mask
@@ -220,18 +245,17 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
                     print(f"Poisson blending failed: {e}")
         
             # Apply opacity blend between the original frame and the swapped frame
-    opacity = getattr(modules.globals, "opacity", 1.0)
     # Ensure opacity is within valid range [0.0, 1.0]
     opacity = max(0.0, min(1.0, opacity))
 
+    # Fast path: skip blending entirely when fully opaque
+    if opacity >= 1.0:
+        return swapped_frame
+
     # Blend the original_frame with the (potentially mouth-masked) swapped_frame
-    # Ensure both frames are uint8 before blending
-    final_swapped_frame = gpu_add_weighted(original_frame.astype(np.uint8), 1 - opacity, swapped_frame.astype(np.uint8), opacity, 0)
+    final_swapped_frame = gpu_add_weighted(original_frame, 1 - opacity, swapped_frame, opacity, 0)
 
-    # Ensure final frame is uint8 after blending (addWeighted should preserve it, but belt-and-suspenders)
-    final_swapped_frame = final_swapped_frame.astype(np.uint8)
-
-    return final_swapped_frame
+    return final_swapped_frame.astype(np.uint8)
 
 
 # --- START: Mac M1-M5 Optimized Face Detection ---
@@ -275,11 +299,21 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
     """Applies sharpening and interpolation with Apple Silicon optimizations."""
     global PREVIOUS_FRAME_RESULT
 
-    processed_frame = current_frame.copy()
+    sharpness_value = getattr(modules.globals, "sharpness", 0.0)
+    enable_interpolation = getattr(modules.globals, "enable_interpolation", False)
+    interpolation_weight = getattr(modules.globals, "interpolation_weight", 0.2)
+
+    # Fast path: skip all post-processing when nothing is enabled
+    needs_sharpening = sharpness_value > 0.0 and swapped_face_bboxes
+    needs_interpolation = enable_interpolation and 0 < interpolation_weight < 1
+    if not needs_sharpening and not needs_interpolation:
+        PREVIOUS_FRAME_RESULT = None
+        return current_frame
+
+    processed_frame = current_frame
 
     # 1. Apply Sharpening (if enabled) with optimized kernel for Apple Silicon
-    sharpness_value = getattr(modules.globals, "sharpness", 0.0)
-    if sharpness_value > 0.0 and swapped_face_bboxes:
+    if needs_sharpening:
         height, width = processed_frame.shape[:2]
         for bbox in swapped_face_bboxes:
             # Ensure bbox is iterable and has 4 elements
@@ -312,12 +346,9 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
 
 
     # 2. Apply Interpolation (if enabled)
-    enable_interpolation = getattr(modules.globals, "enable_interpolation", False)
-    interpolation_weight = getattr(modules.globals, "interpolation_weight", 0.2)
-
     final_frame = processed_frame # Start with the current (potentially sharpened) frame
 
-    if enable_interpolation and 0 < interpolation_weight < 1:
+    if needs_interpolation:
         if PREVIOUS_FRAME_RESULT is not None and PREVIOUS_FRAME_RESULT.shape == processed_frame.shape and PREVIOUS_FRAME_RESULT.dtype == processed_frame.dtype:
             # Perform interpolation
             try:
@@ -337,15 +368,10 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
             PREVIOUS_FRAME_RESULT = final_frame.copy()
         else:
             # If previous frame invalid or doesn't match, use current frame and update state
-            if PREVIOUS_FRAME_RESULT is not None and PREVIOUS_FRAME_RESULT.shape != processed_frame.shape:
-                # print("Info: Frame shape changed, resetting interpolation state.") # Debug
-                pass
             PREVIOUS_FRAME_RESULT = processed_frame.copy()
     else:
          # If interpolation is off or weight is invalid, just use the current frame
-         # Update state with the current (potentially sharpened) frame
-         # Reset previous frame state if interpolation was just turned off or weight is invalid
-         PREVIOUS_FRAME_RESULT = processed_frame.copy()
+         PREVIOUS_FRAME_RESULT = None
 
 
     return final_frame
@@ -372,18 +398,16 @@ def process_frame(source_face: Face, temp_frame: Frame) -> Frame:
     if modules.globals.many_faces:
         many_faces = get_many_faces(processed_frame)
         if many_faces:
-            current_swap_target = processed_frame.copy() # Apply swaps sequentially on a copy
             for target_face in many_faces:
-                current_swap_target = swap_face(source_face, target_face, current_swap_target)
-                if target_face is not None and hasattr(target_face, "bbox") and target_face.bbox is not None:
+                processed_frame = swap_face(source_face, target_face, processed_frame)
+                if hasattr(target_face, "bbox") and target_face.bbox is not None:
                     swapped_face_bboxes.append(target_face.bbox.astype(int))
-            processed_frame = current_swap_target # Assign the final result after all swaps
     else:
         target_face = get_one_face(processed_frame)
         if target_face:
             processed_frame = swap_face(source_face, target_face, processed_frame)
-            if target_face is not None and hasattr(target_face, "bbox") and target_face.bbox is not None:
-                    swapped_face_bboxes.append(target_face.bbox.astype(int))
+            if hasattr(target_face, "bbox") and target_face.bbox is not None:
+                swapped_face_bboxes.append(target_face.bbox.astype(int))
 
     # Apply sharpening and interpolation
     final_frame = apply_post_processing(processed_frame, swapped_face_bboxes)
@@ -461,7 +485,22 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
 
     else:
         # Live stream or webcam processing (analyze faces on the fly)
-        detected_faces = get_many_faces(processed_frame)
+        # Use downscaled frame for faster detection, then scale back coordinates
+        h, w = processed_frame.shape[:2]
+        live_scale = 0.375
+        small = cv2.resize(processed_frame, (int(w * live_scale), int(h * live_scale)), interpolation=cv2.INTER_NEAREST)
+        detected_faces = get_many_faces(small)
+        if detected_faces:
+            inv_scale = 1.0 / live_scale
+            for f in detected_faces:
+                if hasattr(f, 'bbox') and f.bbox is not None:
+                    f.bbox = f.bbox * inv_scale
+                if hasattr(f, 'kps') and f.kps is not None:
+                    f.kps = f.kps * inv_scale
+                if hasattr(f, 'landmark_2d_106') and f.landmark_2d_106 is not None:
+                    f.landmark_2d_106 = f.landmark_2d_106 * inv_scale
+                if hasattr(f, 'landmark_3d_68') and f.landmark_3d_68 is not None:
+                    f.landmark_3d_68 = f.landmark_3d_68 * inv_scale
         if detected_faces:
             if modules.globals.many_faces:
                  source_face = default_source_face() # Use default source for all detected targets
@@ -501,13 +540,11 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
 
 
     # Perform swaps based on the collected pairs
-    current_swap_target = processed_frame.copy() # Apply swaps sequentially
     for source_face, target_face in source_target_pairs:
         if source_face and target_face:
-            current_swap_target = swap_face(source_face, target_face, current_swap_target)
-            if target_face is not None and hasattr(target_face, "bbox") and target_face.bbox is not None:
+            processed_frame = swap_face(source_face, target_face, processed_frame)
+            if hasattr(target_face, "bbox") and target_face.bbox is not None:
                 swapped_face_bboxes.append(target_face.bbox.astype(int))
-    processed_frame = current_swap_target # Assign final result
 
 
     # Apply sharpening and interpolation

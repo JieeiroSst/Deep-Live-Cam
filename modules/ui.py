@@ -923,19 +923,19 @@ def get_available_cameras():
         camera_names = []
 
         if platform.system() == "Darwin":  # macOS specific handling
-            # Try to open the default FaceTime camera first
-            cap = cv2.VideoCapture(0)
-            if cap.isOpened():
-                camera_indices.append(0)
-                camera_names.append("FaceTime Camera")
-                cap.release()
-
-            # On macOS, additional cameras typically use indices 1 and 2
-            for i in [1, 2]:
-                cap = cv2.VideoCapture(i)
+            # Use cv2_enumerate_cameras for fast, non-blocking detection
+            try:
+                for cam_info in enumerate_cameras(cv2.CAP_AVFOUNDATION):
+                    idx = cam_info.index
+                    name = getattr(cam_info, 'name', None) or f"Camera {idx}"
+                    camera_indices.append(idx)
+                    camera_names.append(name)
+            except Exception:
+                # Fallback: only probe index 0 to avoid slow timeouts
+                cap = cv2.VideoCapture(0)
                 if cap.isOpened():
-                    camera_indices.append(i)
-                    camera_names.append(f"Camera {i}")
+                    camera_indices.append(0)
+                    camera_names.append("FaceTime Camera")
                     cap.release()
         else:
             # Linux camera detection - test first 10 indices
@@ -977,10 +977,10 @@ def _capture_thread_func(cap, capture_queue, stop_event):
 # How often to run full face detection. On intermediate frames the last
 # detected face positions are reused, which significantly reduces the
 # per-frame cost of the processing thread.
-DETECT_EVERY_N = 2
+DETECT_EVERY_N = 6
 
 
-def _processing_thread_func(capture_queue, processed_queue, stop_event):
+def _processing_thread_func(capture_queue, processed_queue, stop_event, models_ready_event=None):
     """Processing thread: takes raw frames from capture_queue, applies face
     processing, and puts results into processed_queue. Drops processed frames
     when the output queue is full so the UI always gets the latest result.
@@ -997,30 +997,84 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
     cached_target_face = None  # cached single-face result
     cached_many_faces = None   # cached many-faces result
 
-    while not stop_event.is_set():
-        try:
-            frame = capture_queue.get(timeout=0.05)
-        except queue.Empty:
-            continue
+    # Live processing scale factor: process at lower resolution for speed
+    LIVE_SCALE = 0.375  # Process at 37.5% resolution for faster detection
 
-        temp_frame = frame.copy()
-        run_detection = (proc_frame_index % DETECT_EVERY_N == 0)
-        proc_frame_index += 1
+    while not stop_event.is_set():
+        # Drain queue to always get the latest frame, skip stale ones
+        frame = None
+        try:
+            while True:
+                frame = capture_queue.get_nowait()
+        except queue.Empty:
+            pass
+        if frame is None:
+            try:
+                frame = capture_queue.get(timeout=0.03)
+            except queue.Empty:
+                continue
+
+        temp_frame = frame
 
         if modules.globals.live_mirror:
             temp_frame = gpu_flip(temp_frame, 1)
+
+        # Pass through raw frames while models are still loading
+        if models_ready_event is not None and not models_ready_event.is_set():
+            try:
+                processed_queue.put_nowait(temp_frame)
+            except queue.Full:
+                try:
+                    processed_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                try:
+                    processed_queue.put_nowait(temp_frame)
+                except queue.Full:
+                    pass
+            continue
+
+        run_detection = (proc_frame_index % DETECT_EVERY_N == 0)
+        proc_frame_index += 1
 
         if not modules.globals.map_faces:
             if source_image is None and modules.globals.source_path:
                 source_image = get_one_face(cv2.imread(modules.globals.source_path))
 
             # Update face detection cache on detection frames
+            # Use downscaled frame for faster detection, faces are still valid for swap
             if run_detection or (cached_target_face is None and cached_many_faces is None):
+                h, w = temp_frame.shape[:2]
+                small_frame = cv2.resize(temp_frame, (int(w * LIVE_SCALE), int(h * LIVE_SCALE)), interpolation=cv2.INTER_NEAREST)
                 if modules.globals.many_faces:
-                    cached_many_faces = get_many_faces(temp_frame)
+                    faces = get_many_faces(small_frame)
+                    if faces:
+                        # Scale face bboxes and landmarks back to original resolution
+                        inv_scale = 1.0 / LIVE_SCALE
+                        for f in faces:
+                            if hasattr(f, 'bbox') and f.bbox is not None:
+                                f.bbox = f.bbox * inv_scale
+                            if hasattr(f, 'kps') and f.kps is not None:
+                                f.kps = f.kps * inv_scale
+                            if hasattr(f, 'landmark_2d_106') and f.landmark_2d_106 is not None:
+                                f.landmark_2d_106 = f.landmark_2d_106 * inv_scale
+                            if hasattr(f, 'landmark_3d_68') and f.landmark_3d_68 is not None:
+                                f.landmark_3d_68 = f.landmark_3d_68 * inv_scale
+                    cached_many_faces = faces
                     cached_target_face = None
                 else:
-                    cached_target_face = get_one_face(temp_frame)
+                    face = get_one_face(small_frame)
+                    if face:
+                        inv_scale = 1.0 / LIVE_SCALE
+                        if hasattr(face, 'bbox') and face.bbox is not None:
+                            face.bbox = face.bbox * inv_scale
+                        if hasattr(face, 'kps') and face.kps is not None:
+                            face.kps = face.kps * inv_scale
+                        if hasattr(face, 'landmark_2d_106') and face.landmark_2d_106 is not None:
+                            face.landmark_2d_106 = face.landmark_2d_106 * inv_scale
+                        if hasattr(face, 'landmark_3d_68') and face.landmark_3d_68 is not None:
+                            face.landmark_3d_68 = face.landmark_3d_68 * inv_scale
+                    cached_target_face = face
                     cached_many_faces = None
 
             for frame_processor in frame_processors:
@@ -1031,12 +1085,10 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
                     # Use cached face positions to skip redundant detection
                     swapped_bboxes = []
                     if modules.globals.many_faces and cached_many_faces:
-                        result = temp_frame.copy()
                         for t_face in cached_many_faces:
-                            result = frame_processor.swap_face(source_image, t_face, result)
+                            temp_frame = frame_processor.swap_face(source_image, t_face, temp_frame)
                             if hasattr(t_face, 'bbox') and t_face.bbox is not None:
                                 swapped_bboxes.append(t_face.bbox.astype(int))
-                        temp_frame = result
                     elif cached_target_face is not None:
                         temp_frame = frame_processor.swap_face(source_image, cached_target_face, temp_frame)
                         if hasattr(cached_target_face, 'bbox') and cached_target_face.bbox is not None:
@@ -1047,6 +1099,7 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
                     temp_frame = frame_processor.process_frame(source_image, temp_frame)
         else:
             modules.globals.target_path = None
+            # For map_faces mode, also use downscaled detection via process_frame_v2
             for frame_processor in frame_processors:
                 if frame_processor.NAME == "DLC.FACE-ENHANCER":
                     if modules.globals.fp_ui["face_enhancer"]:
@@ -1090,6 +1143,13 @@ def _processing_thread_func(capture_queue, processed_queue, stop_event):
 def create_webcam_preview(camera_index: int):
     global preview_label, PREVIEW
 
+    # Kick off model preloading in the background immediately so the camera
+    # feed appears without waiting for heavy model init.
+    from modules.processors.frame.face_swapper import preload_models, MODELS_LOADED
+    MODELS_LOADED.clear()
+    preload_thread = threading.Thread(target=preload_models, daemon=True)
+    preload_thread.start()
+
     cap = VideoCapturer(camera_index)
     if not cap.start(PREVIEW_DEFAULT_WIDTH, PREVIEW_DEFAULT_HEIGHT, 60):
         update_status("Failed to start camera")
@@ -1112,37 +1172,46 @@ def create_webcam_preview(camera_index: int):
     )
     cap_thread.start()
 
-    # Start processing thread
+    # Start processing thread – pass the models_ready event so it can show
+    # raw camera frames while models are still loading.
     proc_thread = threading.Thread(
         target=_processing_thread_func,
-        args=(capture_queue, processed_queue, stop_event),
+        args=(capture_queue, processed_queue, stop_event, MODELS_LOADED),
         daemon=True,
     )
     proc_thread.start()
 
     # Main (UI) thread: pull processed frames and update the display
     while not stop_event.is_set():
+        # Drain to get the latest processed frame, skip stale ones
+        temp_frame = None
         try:
-            temp_frame = processed_queue.get(timeout=0.03)
+            while True:
+                temp_frame = processed_queue.get_nowait()
         except queue.Empty:
-            ROOT.update()
-            continue
+            pass
+        if temp_frame is None:
+            try:
+                temp_frame = processed_queue.get(timeout=0.008)  # Reduce wait for faster responsiveness
+            except queue.Empty:
+                ROOT.update()
+                continue
 
-        if modules.globals.live_resizable:
-            temp_frame = fit_image_to_size(
-                temp_frame, PREVIEW.winfo_width(), PREVIEW.winfo_height()
-            )
-        else:
-            temp_frame = fit_image_to_size(
-                temp_frame, PREVIEW.winfo_width(), PREVIEW.winfo_height()
-            )
+        # Resize to fit preview window using fast cv2 resize
+        preview_w = PREVIEW.winfo_width()
+        preview_h = PREVIEW.winfo_height()
+        if preview_w > 1 and preview_h > 1:
+            h, w = temp_frame.shape[:2]
+            scale = min(preview_w / w, preview_h / h)
+            if scale < 0.99 or scale > 1.01:
+                new_w, new_h = int(w * scale), int(h * scale)
+                if new_w > 0 and new_h > 0:
+                    temp_frame = cv2.resize(temp_frame, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
 
+        # Convert BGR to RGB and create CTkImage directly (skip PIL ImageOps.contain overhead)
         image = gpu_cvt_color(temp_frame, cv2.COLOR_BGR2RGB)
         image = Image.fromarray(image)
-        image = ImageOps.contain(
-            image, (temp_frame.shape[1], temp_frame.shape[0]), Image.LANCZOS
-        )
-        image = ctk.CTkImage(image, size=image.size)
+        image = ctk.CTkImage(image, size=(temp_frame.shape[1], temp_frame.shape[0]))
         preview_label.configure(image=image)
         ROOT.update()
 
