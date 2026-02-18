@@ -3,6 +3,7 @@ import shutil
 from typing import Any
 import insightface
 import threading
+import platform
 
 import cv2
 import numpy as np
@@ -15,6 +16,7 @@ from pathlib import Path
 
 FACE_ANALYSER = None
 FACE_ANALYSER_LOCK = threading.Lock()
+IS_APPLE_SILICON = platform.system() == 'Darwin' and platform.machine() == 'arm64'
 
 
 def get_face_analyser() -> Any:
@@ -25,9 +27,17 @@ def get_face_analyser() -> Any:
         with FACE_ANALYSER_LOCK:
             # Double-check after acquiring lock
             if FACE_ANALYSER is None:
+                # CoreML has shape mismatch issues with insightface models
+                # (static vs dynamic output shapes), so fall back to CPU on Apple Silicon
+                providers = []
+                for p in modules.globals.execution_providers:
+                    if p == "CoreMLExecutionProvider" and IS_APPLE_SILICON:
+                        providers.append("CPUExecutionProvider")
+                    else:
+                        providers.append(p)
                 FACE_ANALYSER = insightface.app.FaceAnalysis(
                     name='buffalo_l',
-                    providers=modules.globals.execution_providers,
+                    providers=providers,
                     allowed_modules=['detection', 'recognition']
                 )
                 FACE_ANALYSER.prepare(ctx_id=0, det_size=(320, 320))
